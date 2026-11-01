@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="theme-color" content="#000000">
+<title>Portal · Sender</title>
+<style>
+  :root { color-scheme: dark; --fg:#e8e8e8; --dim:#8a8a8a; --acc:#7CFFB2; --bg:#000; --panel:#141414; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:15px/1.4 system-ui, sans-serif; overflow:hidden; }
+  #preview { position:fixed; inset:0; width:100%; height:100%; object-fit:contain; background:#000; }
+  #status { position:fixed; top:env(safe-area-inset-top); left:0; right:0; padding:10px 14px; font-size:13px; color:var(--dim); text-shadow:0 1px 2px #000; pointer-events:none; }
+  #status b { color:var(--acc); font-weight:600; }
+  #bar { position:fixed; left:0; right:0; bottom:0; padding:10px 12px calc(10px + env(safe-area-inset-bottom)); background:linear-gradient(transparent, rgba(0,0,0,.85) 35%); display:none; flex-wrap:wrap; gap:8px; }
+  #bar.on { display:flex; }
+  button, select { font:inherit; color:var(--fg); background:var(--panel); border:1px solid #2c2c2c; border-radius:10px; padding:9px 13px; }
+  button.on { border-color:var(--acc); color:var(--acc); }
+  button[hidden], label[hidden] { display:none; }
+  label.slider { flex:1 1 100%; display:flex; align-items:center; gap:10px; color:var(--dim); font-size:13px; }
+  label.slider input { flex:1; }
+  #start { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; background:#000; z-index:5; text-align:center; padding:24px; }
+  #start button { font-size:18px; padding:16px 30px; background:var(--acc); color:#000; border:0; border-radius:14px; font-weight:600; }
+  #start p { color:var(--dim); max-width:30ch; margin:0; }
+  #blackout { position:fixed; inset:0; background:#000; z-index:9; display:none; }
+  #blackout.on { display:block; }
+  #blackout span { position:absolute; bottom:calc(12px + env(safe-area-inset-bottom)); left:0; right:0; text-align:center; color:#1c1c1c; font-size:12px; }
+</style>
+</head>
+<body>
+<video id="preview" muted playsinline autoplay></video>
+<div id="status">Starting…</div>
+
+<div id="bar">
+  <label class="slider" id="expRow" hidden>Exposure <input id="exp" type="range"></label>
+  <button id="bTorch" hidden>Light</button>
+  <button id="bExpLock" hidden>Lock exposure</button>
+  <button id="bWbLock" hidden>Lock white bal.</button>
+  <button id="bCam">Next camera</button>
+  <select id="res">
+    <option value="640x480">640×480</option>
+    <option value="1280x720" selected>1280×720</option>
+    <option value="1920x1080">1920×1080</option>
+  </select>
+  <button id="bBlack">Blackout screen</button>
+</div>
+
+<div id="blackout"><span>tap to wake the screen</span></div>
+
+<div id="start">
+  <p id="roomLabel"></p>
+  <button id="go">Tap to start camera</button>
+  <p>Point this phone at the lit, dark area. Use “Light” for the torch and “Blackout” so the screen doesn't light up the box.</p>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const room = (params.get("room") || "").trim();
+const statusEl = $("status");
+const setStatus = (html) => (statusEl.innerHTML = html);
+
+if (!room) { location.replace("/"); }
+$("roomLabel").textContent = "Room: " + room;
+
+let ws, pc, stream, track, wakeLock, ice = [{ urls: "stun:stun.cloudflare.com:3478" }];
+let devices = [], devIndex = -1, retry = 0;
+let peerPresent = false;
+const settingsState = { torch: false, expLock: false, wbLock: false };
+
+/* ---------- camera ---------- */
+async function startCamera() {
+  const [w, h] = $("res").value.split("x").map(Number);
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  const video = { width: { ideal: w }, height: { ideal: h }, frameRate: { ideal: 30, max: 30 } };
+  if (devIndex >= 0 && devices[devIndex]) video.deviceId = { exact: devices[devIndex].deviceId };
+  else video.facingMode = { ideal: "environment" };
+  stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
+  track = stream.getVideoTracks()[0];
+  try { track.contentHint = "motion"; } catch {}
+  $("preview").srcObject = stream;
+  if (!devices.length) {
+    devices = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "videoinput");
+    const cur = track.getSettings().deviceId;
+    devIndex = Math.max(0, devices.findIndex((d) => d.deviceId === cur));
+  }
+  settingsState.torch = settingsState.expLock = settingsState.wbLock = false;
+  ["bTorch", "bExpLock", "bWbLock"].forEach((id) => $(id).classList.remove("on"));
+  setupControls();
+  if (pc) {
+    const sender = pc.getSenders().find((s) => s.track && s.track.kind === "video");
+    if (sender) await sender.replaceTrack(track);
+  }
+}
+
+function setupControls() {
+  const caps = track.getCapabilities ? track.getCapabilities() : {};
+  $("bTorch").hidden = !caps.torch;
+  $("bExpLock").hidden = !(caps.exposureMode || []).includes("manual");
+  $("bWbLock").hidden = !(caps.whiteBalanceMode || []).includes("manual");
+  const ec = caps.exposureCompensation;
+  $("expRow").hidden = !ec;
+  if (ec) {
+    const e = $("exp");
+    e.min = ec.min; e.max = ec.max; e.step = ec.step || 0.1;
+    e.value = track.getSettings().exposureCompensation ?? 0;
+  }
+}
+const apply = (c) => track.applyConstraints({ advanced: [c] }).catch((e) => console.warn("constraint failed", c, e));
+
+$("exp").oninput = (e) => apply({ exposureCompensation: +e.target.value });
+$("bTorch").onclick = (e) => {
+  settingsState.torch = !settingsState.torch;
+  e.target.classList.toggle("on", settingsState.torch);
+  apply({ torch: settingsState.torch });
+};
+$("bExpLock").onclick = (e) => {
+  settingsState.expLock = !settingsState.expLock;
+  e.target.classList.toggle("on", settingsState.expLock);
+  const s = track.getSettings();
+  if (settingsState.expLock) {
+    const c = { exposureMode: "manual" };
+    if (s.exposureTime) c.exposureTime = s.exposureTime;
+    if (s.iso) c.iso = s.iso;
+    apply(c);
+  } else apply({ exposureMode: "continuous" });
+};
+$("bWbLock").onclick = (e) => {
+  settingsState.wbLock = !settingsState.wbLock;
+  e.target.classList.toggle("on", settingsState.wbLock);
+  const s = track.getSettings();
+  if (settingsState.wbLock) {
+    const c = { whiteBalanceMode: "manual" };
+    if (s.colorTemperature) c.colorTemperature = s.colorTemperature;
+    apply(c);
+  } else apply({ whiteBalanceMode: "continuous" });
+};
+$("bCam").onclick = async () => {
+  if (devices.length < 2) return;
+  devIndex = (devIndex + 1) % devices.length;
+  try { await startCamera(); } catch (e) { setStatus("Camera error: " + e.message); }
+};
+$("res").onchange = () => startCamera().catch((e) => setStatus("Camera error: " + e.message));
+$("bBlack").onclick = () => $("blackout").classList.add("on");
+$("blackout").onclick = () => $("blackout").classList.remove("on");
+
+/* ---------- WebRTC ---------- */
+function preferH264(transceiver) {
+  try {
+    const caps = RTCRtpSender.getCapabilities("video");
+    if (!caps) return;
+    const score = (c) => c.mimeType === "video/H264" ? (/packetization-mode=1/.test(c.sdpFmtpLine || "") ? 0 : 1) : 2;
+    const sorted = [...caps.codecs].sort((a, b) => score(a) - score(b));
+    transceiver.setCodecPreferences(sorted);
+  } catch (e) { console.warn("codec prefs", e); }
+}
+
+async function startCall() {
+  if (!track) return;
+  if (pc) pc.close();
+  pc = new RTCPeerConnection({ iceServers: ice });
+  const tr = pc.addTransceiver(track, { direction: "sendonly", streams: [stream] });
+  preferH264(tr);
+  pc.onicecandidate = (e) => e.candidate && send({ type: "ice", candidate: e.candidate });
+  pc.onconnectionstatechange = refreshStatus;
+  const offer = await pc.createOffer();
+  await pc.setLocalDescription(offer);
+  try {
+    const p = tr.sender.getParameters();
+    if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+    p.encodings[0].maxBitrate = 6_000_000;
+    p.encodings[0].maxFramerate = 30;
+    p.degradationPreference = "maintain-framerate";
+    await tr.sender.setParameters(p);
+  } catch {}
+  send({ type: "offer", sdp: pc.localDescription });
+  refreshStatus();
+}
+
+function refreshStatus() {
+  const ws_ok = ws && ws.readyState === 1;
+  if (!ws_ok) return setStatus("Reconnecting to server…");
+  if (!peerPresent) return setStatus(`Room <b>${room}</b> · waiting for the hologram page…`);
+  const st = pc ? pc.connectionState : "new";
+  if (st === "connected") return setStatus(`Room <b>${room}</b> · <b>live</b>`);
+  setStatus(`Room <b>${room}</b> · connecting (${st})…`);
+}
+
+/* ---------- signaling ---------- */
+const send = (o) => ws && ws.readyState === 1 && ws.send(JSON.stringify(o));
+let pending = [];
+
+function connectWS() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${proto}//${location.host}/ws?room=${encodeURIComponent(room)}&role=sender`);
+  ws.onopen = () => { retry = 0; refreshStatus(); };
+  ws.onmessage = async (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch { return; }
+    if (m.type === "peers") { peerPresent = m.present.includes("viewer"); if (peerPresent) startCall(); }
+    else if (m.type === "peer-joined" && m.role === "viewer") { peerPresent = true; startCall(); }
+    else if (m.type === "peer-left") { peerPresent = false; if (pc) { pc.close(); pc = null; } }
+    else if (m.type === "answer" && pc) {
+      await pc.setRemoteDescription(m.sdp);
+      for (const c of pending) pc.addIceCandidate(c).catch(() => {});
+      pending = [];
+    }
+    else if (m.type === "ice" && pc) {
+      if (pc.remoteDescription) pc.addIceCandidate(m.candidate).catch(() => {});
+      else pending.push(m.candidate);
+    }
+    else if (m.type === "replaced") { ws.onclose = null; setStatus("Another sender took over this room."); }
+    refreshStatus();
+  };
+  ws.onclose = () => {
+    refreshStatus();
+    setTimeout(connectWS, Math.min(1000 * 2 ** retry++, 8000));
+  };
+}
+setInterval(() => ws && ws.readyState === 1 && ws.send("ping"), 20000);
+
+/* ---------- start ---------- */
+async function keepAwake() {
+  try { wakeLock = await navigator.wakeLock.request("screen"); } catch {}
+}
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") keepAwake(); });
+
+$("go").onclick = async () => {
+  try {
+    try { const r = await fetch("/ice"); ice = (await r.json()).iceServers || ice; } catch {}
+    await startCamera();
+    $("start").style.display = "none";
+    $("bar").classList.add("on");
+    keepAwake();
+    connectWS();
+  } catch (e) {
+    $("start").querySelector("p:last-child").textContent = "Camera error: " + e.message + " (camera needs HTTPS)";
+  }
+};
+</script>
+</body>
+</html>

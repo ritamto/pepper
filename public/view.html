@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#000000">
+<title>Portal · Hologram</title>
+<style>
+  :root { color-scheme: dark; --fg:#e8e8e8; --dim:#8a8a8a; --acc:#7CFFB2; --panel:rgba(18,18,18,.94); }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin:0; height:100%; background:#000; color:var(--fg); font:14px/1.4 system-ui, sans-serif; overflow:hidden; touch-action:none; -webkit-user-select:none; user-select:none; }
+  canvas { position:fixed; inset:0; width:100%; height:100%; display:block; background:#000; }
+  #vid { position:fixed; left:0; top:0; width:2px; height:2px; opacity:.01; pointer-events:none; }
+  #msg { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; color:#555; font-size:14px; pointer-events:none; text-align:center; padding:20px; }
+  #gear { position:fixed; top:calc(6px + env(safe-area-inset-top)); left:6px; width:38px; height:38px; border-radius:50%; border:1px solid #333; background:#000; color:#777; opacity:.35; font-size:18px; z-index:7; }
+  #panel { position:fixed; left:0; right:0; bottom:0; max-height:62vh; overflow:auto; background:var(--panel); border-top:1px solid #2a2a2a; padding:12px 14px calc(14px + env(safe-area-inset-bottom)); z-index:6; display:none; touch-action:pan-y; }
+  #panel.on { display:block; }
+  .row { display:flex; align-items:center; gap:10px; margin:7px 0; color:var(--dim); font-size:13px; }
+  .row span:first-child { width:78px; flex:none; }
+  .row input[type=range] { flex:1; min-width:0; }
+  .row output { width:44px; text-align:right; color:var(--fg); font-variant-numeric:tabular-nums; }
+  .btns { display:flex; flex-wrap:wrap; gap:7px; margin:10px 0 4px; }
+  button { font:inherit; color:var(--fg); background:#1d1d1d; border:1px solid #333; border-radius:9px; padding:8px 12px; }
+  button.on { border-color:var(--acc); color:var(--acc); }
+  #info { color:var(--dim); font-size:12px; margin-top:8px; }
+  #start { position:fixed; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:14px; background:#000; z-index:9; text-align:center; padding:24px; }
+  #start button { font-size:18px; padding:16px 30px; background:var(--acc); color:#000; border:0; border-radius:14px; font-weight:600; }
+  #start p { color:var(--dim); max-width:32ch; margin:0; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<video id="vid" muted playsinline autoplay></video>
+<div id="msg"></div>
+<button id="gear" aria-label="settings">⚙</button>
+
+<div id="panel">
+  <div id="sliders"></div>
+  <div class="row" style="margin-top:14px"><span style="width:auto;color:#e8e8e8">Object-only mode (paper marker)</span></div>
+  <div class="btns">
+    <button id="bCap">1 · Capture empty</button>
+    <button id="bSample">2 · Sample paper</button>
+    <button id="bMask">Object only</button>
+    <button id="bDebug">Mask debug</button>
+    <button id="bHide">Hide paper</button>
+  </div>
+  <div id="maskInfo" class="row"></div>
+  <div class="btns">
+    <button id="bRot">Rotate 0°</button>
+    <button id="bFx">Flip X</button>
+    <button id="bFy">Flip Y</button>
+    <button id="bPat">Test pattern</button>
+    <button id="bGuide">Show frame</button>
+    <button id="bReset">Reset</button>
+    <button id="bClose">Close</button>
+  </div>
+  <div id="info"></div>
+</div>
+
+<div id="start">
+  <p id="roomLabel"></p>
+  <button id="go">Tap to start</button>
+  <p>Tip: Share → Add to Home Screen, then open from there for a fullscreen, bar-free view.</p>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.search);
+const room = (params.get("room") || "").trim();
+if (!room) location.replace("/");
+$("roomLabel").textContent = "Room: " + room;
+
+/* ---------- settings (persisted) ---------- */
+const KEY = "portal.view.v1";
+const DEFAULTS = {
+  w: 0.92, h: 0.62, cx: 0.5, cy: 0.5,   // frame: size and centre, as fractions of the screen
+  zoom: 1, panX: 0, panY: 0,
+  rot: 0, flipX: false, flipY: false,
+  black: 0.14, white: 0.9, gamma: 1.0, gain: 1.0,
+  pattern: false, guide: false,
+  // object-only mode
+  mask: true, debug: false, hideTape: true,
+  thr: 0.10, hueTol: 0.05, sMin: 0.35, vMin: 0.2, grow: 1, hold: 0.6, tapeH: -1,
+};
+let S = { ...DEFAULTS };
+try { Object.assign(S, JSON.parse(localStorage.getItem(KEY) || "{}")); } catch {}
+const save = () => { try { localStorage.setItem(KEY, JSON.stringify(S)); } catch {} };
+
+const SLIDERS = [
+  ["black", "Black cut", 0, 0.6, 0.005, "Everything darker than this becomes pure black (invisible in the pane)."],
+  ["white", "White point", 0.4, 1, 0.005],
+  ["gamma", "Gamma", 0.4, 2.2, 0.01],
+  ["gain", "Brightness", 0.5, 2.5, 0.01],
+  ["w", "Frame width", 0.2, 1, 0.005],
+  ["h", "Frame height", 0.2, 1, 0.005],
+  ["cx", "Frame X", 0, 1, 0.005],
+  ["cy", "Frame Y", 0, 1, 0.005],
+  ["zoom", "Zoom", 0.3, 3, 0.01],
+  ["panX", "Pan X", -1, 1, 0.005],
+  ["panY", "Pan Y", -1, 1, 0.005],
+  ["thr", "Change thresh.", 0.02, 0.5, 0.005],
+  ["hueTol", "Paper hue tol.", 0.01, 0.2, 0.005],
+  ["sMin", "Paper min sat.", 0.1, 0.95, 0.01],
+  ["vMin", "Paper min bright", 0.05, 0.9, 0.01],
+  ["grow", "Edge grow (px)", 0, 4, 1],
+  ["hold", "Keep if paper lost (s)", 0, 3, 0.1],
+];
+const sliderEls = {};
+for (const [k, label, min, max, step] of SLIDERS) {
+  const row = document.createElement("div");
+  row.className = "row";
+  row.innerHTML = `<span>${label}</span><input type="range" min="${min}" max="${max}" step="${step}"><output></output>`;
+  const input = row.querySelector("input"), out = row.querySelector("output");
+  input.oninput = () => { S[k] = +input.value; out.textContent = (+input.value).toFixed(2); save(); };
+  sliderEls[k] = { input, out };
+  $("sliders").appendChild(row);
+}
+function syncUI() {
+  for (const k in sliderEls) { sliderEls[k].input.value = S[k]; sliderEls[k].out.textContent = (+S[k]).toFixed(2); }
+  $("bRot").textContent = `Rotate ${S.rot * 90}°`;
+  $("bFx").classList.toggle("on", S.flipX);
+  $("bFy").classList.toggle("on", S.flipY);
+  $("bPat").classList.toggle("on", S.pattern);
+  $("bGuide").classList.toggle("on", S.guide);
+  $("bMask").classList.toggle("on", S.mask);
+  $("bDebug").classList.toggle("on", S.debug);
+  $("bHide").classList.toggle("on", S.hideTape);
+}
+$("bMask").onclick = () => { S.mask = !S.mask; save(); syncUI(); };
+$("bDebug").onclick = () => { S.debug = !S.debug; save(); syncUI(); };
+$("bHide").onclick = () => { S.hideTape = !S.hideTape; save(); syncUI(); };
+$("bCap").onclick = () => captureEmpty(3);
+$("bSample").onclick = () => samplePaper(3);
+$("bRot").onclick = () => { S.rot = (S.rot + 1) % 4; save(); syncUI(); };
+$("bFx").onclick = () => { S.flipX = !S.flipX; save(); syncUI(); };
+$("bFy").onclick = () => { S.flipY = !S.flipY; save(); syncUI(); };
+$("bPat").onclick = () => { S.pattern = !S.pattern; save(); syncUI(); };
+$("bGuide").onclick = () => { S.guide = !S.guide; save(); syncUI(); };
+$("bReset").onclick = () => { S = { ...DEFAULTS }; save(); syncUI(); };
+$("bClose").onclick = () => $("panel").classList.remove("on");
+$("gear").onclick = () => $("panel").classList.toggle("on");
+syncUI();
+
+/* ---------- WebGL ---------- */
+const canvas = $("gl"), vid = $("vid");
+const gl = canvas.getContext("webgl", { antialias: false, alpha: false, powerPreference: "high-performance" });
+
+const VS = `attribute vec2 p; varying vec2 uv; void main(){ uv = p*0.5+0.5; gl_Position = vec4(p,0.,1.); }`;
+const FS = `
+precision highp float;
+varying vec2 uv;
+uniform sampler2D tex;
+uniform vec2  win;      // frame size, fraction of screen
+uniform vec2  ctr;      // frame centre, fraction of screen (y up)
+uniform float aWin;     // frame aspect in pixels (w/h)
+uniform float aVid;     // video aspect (w/h)
+uniform float zoom;
+uniform vec2  pan;
+uniform int   rot;
+uniform vec2  flip;     // 1 = flipped
+uniform vec3  lv;       // black, white, gamma
+uniform float gain;
+uniform float pattern;
+uniform float guide;
+uniform float haveVideo;
+uniform sampler2D mask;   // R = object, G = paper marker (video space)
+uniform float useMask;
+uniform float debug;
+uniform float hideTape;
+
+vec3 patternColor(vec2 t){
+  vec2 c = t - 0.5;
+  float ring = smoothstep(0.012, 0.0, abs(length(c) - 0.33));
+  float corner = step(0.06, t.x) * step(t.x, 0.26) * step(0.74, t.y) * step(t.y, 0.94);   // top-left block
+  float bar = step(0.46, t.x) * step(t.x, 0.54) * step(0.0, t.y) * step(t.y, 0.12);        // bottom stem
+  float ramp = step(0.9, t.x) * t.y;                                                      // right-edge gradient
+  return vec3(max(max(ring, corner), max(bar, ramp)));
+}
+
+void main(){
+  vec2 p = uv - ctr;
+  vec2 n = p / win;                       // -0.5..0.5 inside the frame
+  float edge = max(abs(n.x), abs(n.y));
+  vec3 col = vec3(0.);
+
+  if (edge <= 0.5) {
+    vec2 q = vec2(n.x * aWin, n.y);       // frame space, units of frame height, y up
+    float aEff = (rot == 1 || rot == 3) ? 1.0 / aVid : aVid;
+    vec2 size = vec2(zoom * aEff, zoom);
+    vec2 vu = q / size + 0.5 + pan * 0.5;
+    if (vu.x >= 0. && vu.x <= 1. && vu.y >= 0. && vu.y <= 1.) {
+      if (flip.x > 0.5) vu.x = 1. - vu.x;
+      if (flip.y > 0.5) vu.y = 1. - vu.y;
+      vec2 c = vu - 0.5;
+      if (rot == 1) c = vec2(c.y, -c.x);
+      else if (rot == 2) c = -c;
+      else if (rot == 3) c = vec2(-c.y, c.x);
+      vec2 t = c + 0.5;
+      if (pattern > 0.5 || haveVideo < 0.5) {
+        col = (pattern > 0.5) ? patternColor(t) : vec3(0.);
+      } else {
+        vec3 raw = texture2D(tex, t).rgb;
+        col = clamp((raw - lv.x) / max(lv.y - lv.x, 0.001), 0., 1.);
+        col = pow(col, vec3(1.0 / lv.z)) * gain;
+        if (useMask > 0.5) {
+          vec4 m = texture2D(mask, t);
+          float k = smoothstep(0.3, 0.7, m.r) * (1.0 - hideTape * smoothstep(0.3, 0.7, m.g));
+          col = (debug > 0.5) ? raw * 0.35 + vec3(m.r * 0.5, m.g * 0.6, 0.0) : col * k;
+        }
+      }
+    }
+  }
+  if (guide > 0.5) {
+    float px = 2.0 / 400.0;
+    if (abs(edge - 0.5) < 0.004) col = max(col, vec3(0., .55, .25));
+    if (abs(n.x) < 0.0015 || abs(n.y) < 0.0015) col = max(col, vec3(0., .22, .1));
+  }
+  gl_FragColor = vec4(col, 1.);
+}`;
+
+function sh(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+const prog = gl.createProgram();
+gl.attachShader(prog, sh(gl.VERTEX_SHADER, VS));
+gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, FS));
+gl.linkProgram(prog);
+if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+gl.useProgram(prog);
+
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+const loc = gl.getAttribLocation(prog, "p");
+gl.enableVertexAttribArray(loc);
+gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+
+const tex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, tex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
+
+const U = {};
+for (const n of ["win", "ctr", "aWin", "aVid", "zoom", "pan", "rot", "flip", "lv", "gain", "pattern", "guide", "haveVideo", "tex", "mask", "useMask", "debug", "hideTape"]) U[n] = gl.getUniformLocation(prog, n);
+
+// Texture unit 1 holds the object mask (small, updated ~15x/s).
+gl.activeTexture(gl.TEXTURE1);
+const maskTex = gl.createTexture();
+gl.bindTexture(gl.TEXTURE_2D, maskTex);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([255, 0, 0, 255]));
+gl.activeTexture(gl.TEXTURE0);
+gl.uniform1i(U.tex, 0);
+gl.uniform1i(U.mask, 1);
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const w = Math.round(innerWidth * dpr), h = Math.round(innerHeight * dpr);
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; gl.viewport(0, 0, w, h); }
+}
+addEventListener("resize", resize);
+
+let frames = 0, lastFpsT = performance.now(), fps = 0, playing = false;
+function draw() {
+  resize();
+  const haveVideo = vid.readyState >= 2 && vid.videoWidth > 0;
+  if (haveVideo && ++procTick % 2 === 0) runMask();
+  if (haveVideo) {
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, vid);
+  }
+  gl.uniform2f(U.win, S.w, S.h);
+  gl.uniform2f(U.ctr, S.cx, 1 - S.cy);
+  gl.uniform1f(U.aWin, (S.w * canvas.width) / (S.h * canvas.height));
+  gl.uniform1f(U.aVid, haveVideo ? vid.videoWidth / vid.videoHeight : 4 / 3);
+  gl.uniform1f(U.zoom, S.zoom);
+  gl.uniform2f(U.pan, S.panX, S.panY);
+  gl.uniform1i(U.rot, S.rot);
+  gl.uniform2f(U.flip, S.flipX ? 1 : 0, S.flipY ? 1 : 0);
+  gl.uniform3f(U.lv, S.black, S.white, S.gamma);
+  gl.uniform1f(U.gain, S.gain);
+  gl.uniform1f(U.pattern, S.pattern ? 1 : 0);
+  gl.uniform1f(U.guide, S.guide ? 1 : 0);
+  gl.uniform1f(U.haveVideo, haveVideo ? 1 : 0);
+  gl.uniform1f(U.useMask, S.mask && maskReady ? 1 : 0);
+  gl.uniform1f(U.debug, S.debug ? 1 : 0);
+  gl.uniform1f(U.hideTape, S.hideTape ? 1 : 0);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  playing = haveVideo && !vid.paused;
+  $("msg").style.display = playing || S.pattern ? "none" : "flex";
+  frames++;
+  const now = performance.now();
+  if (now - lastFpsT > 1000) {
+    fps = Math.round((frames * 1000) / (now - lastFpsT)); frames = 0; lastFpsT = now;
+    $("info").textContent = `render ${fps} fps · video ${vid.videoWidth || 0}×${vid.videoHeight || 0} · ${connState}` +
+      (S.mask && maskReady ? ` · paper ${tapeSeen ? "seen" : "NOT seen"}` : "");
+  }
+  requestAnimationFrame(draw);
+}
+
+/* ---------- object-only mask ----------
+   1. "Capture empty" averages ~20 frames of the empty scene (the reference).
+   2. "Sample paper" stores the hue of the coloured paper held in the middle of the picture.
+   3. Every other frame, at 160px wide: pixels that differ from the reference are "changed";
+      pixels of the paper colour are the marker. Only the changed blob that touches the
+      marker is kept, so anything else entering the scene stays invisible. */
+const PW = 160;
+let PH = 120, N = PW * PH, procTick = 0;
+let ref = null, refAcc = null, captureLeft = 0, sampleReq = false;
+let smooth = null, rgba = null, lastFinal = null, lastTape = null, lastSeen = 0;
+let tapeSeen = false, maskReady = false;
+const pcv = document.createElement("canvas");
+const pctx = pcv.getContext("2d", { willReadFrequently: true });
+const setMaskInfo = (t) => ($("maskInfo").textContent = t);
+const refreshMaskInfo = () =>
+  setMaskInfo(`empty scene: ${ref ? "✓" : "✗ (step 1)"} · paper colour: ${S.tapeH >= 0 ? "✓" : "✗ (step 2)"}`);
+
+function captureEmpty(delay = 3) {
+  setMaskInfo(`Capturing the empty scene in ${delay}s. Keep hands and objects out of view.`);
+  setTimeout(() => { refAcc = null; captureLeft = 20; }, delay * 1000);
+}
+function samplePaper(delay = 3) {
+  setMaskInfo(`Sampling in ${delay}s. Hold the coloured paper in the middle of the picture.`);
+  setTimeout(() => (sampleReq = true), delay * 1000);
+}
+
+let hH = 0, hS = 0, hV = 0;
+function rgb2hsv(r, g, b) {
+  r /= 255; g /= 255; b /= 255;
+  const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
+  hV = mx; hS = mx === 0 ? 0 : d / mx;
+  if (d === 0) hH = 0;
+  else if (mx === r) hH = (((g - b) / d + 6) % 6) / 6;
+  else if (mx === g) hH = ((b - r) / d + 2) / 6;
+  else hH = ((r - g) / d + 4) / 6;
+}
+
+function dilate(src, r) {
+  if (r <= 0) return src;
+  const tmp = new Uint8Array(N), out = new Uint8Array(N);
+  for (let y = 0; y < PH; y++) for (let x = 0; x < PW; x++) {
+    let v = 0;
+    for (let k = Math.max(0, x - r); k <= Math.min(PW - 1, x + r) && !v; k++) v = src[y * PW + k];
+    tmp[y * PW + x] = v;
+  }
+  for (let y = 0; y < PH; y++) for (let x = 0; x < PW; x++) {
+    let v = 0;
+    for (let k = Math.max(0, y - r); k <= Math.min(PH - 1, y + r) && !v; k++) v = tmp[k * PW + x];
+    out[y * PW + x] = v;
+  }
+  return out;
+}
+
+function runMask() {
+  const vw = vid.videoWidth, vh = vid.videoHeight;
+  const ph = Math.max(8, Math.round((PW * vh) / vw));
+  if (pcv.width !== PW || ph !== PH) {
+    PH = ph; N = PW * PH; pcv.width = PW; pcv.height = PH;
+    ref = null; refAcc = null; smooth = new Float32Array(N); rgba = new Uint8Array(N * 4);
+    lastFinal = lastTape = null; maskReady = false;
+  }
+  pctx.drawImage(vid, 0, 0, PW, PH);
+  const d = pctx.getImageData(0, 0, PW, PH).data;
+
+  if (captureLeft > 0) {
+    if (!refAcc) refAcc = new Float32Array(N * 3);
+    for (let i = 0; i < N; i++) { refAcc[i * 3] += d[i * 4]; refAcc[i * 3 + 1] += d[i * 4 + 1]; refAcc[i * 3 + 2] += d[i * 4 + 2]; }
+    if (--captureLeft === 0) {
+      ref = new Uint8ClampedArray(N * 3);
+      for (let j = 0; j < N * 3; j++) ref[j] = refAcc[j] / 20;
+      refAcc = null; refreshMaskInfo();
+    }
+    return;
+  }
+  if (sampleReq) {
+    sampleReq = false;
+    let r = 0, g = 0, b = 0, c = 0;
+    for (let y = (PH >> 1) - 6; y < (PH >> 1) + 6; y++) for (let x = (PW >> 1) - 6; x < (PW >> 1) + 6; x++) {
+      const i = (y * PW + x) * 4; r += d[i]; g += d[i + 1]; b += d[i + 2]; c++;
+    }
+    rgb2hsv(r / c, g / c, b / c);
+    if (hS < 0.25) setMaskInfo("That paper looks too grey. Use a bright saturated colour (magenta, green, orange).");
+    else {
+      S.tapeH = hH; S.sMin = Math.max(0.2, hS * 0.55); S.vMin = Math.max(0.1, hV * 0.45);
+      save(); syncUI(); refreshMaskInfo();
+    }
+    return;
+  }
+
+  maskReady = !!ref && S.tapeH >= 0;
+  if (!S.mask || !maskReady) return;
+
+  const fg = new Uint8Array(N), tp = new Uint8Array(N);
+  const thr = S.thr * 255 * 3;
+  let tcount = 0;
+  for (let i = 0; i < N; i++) {
+    const r = d[i * 4], g = d[i * 4 + 1], b = d[i * 4 + 2];
+    const diff = Math.abs(r - ref[i * 3]) + Math.abs(g - ref[i * 3 + 1]) + Math.abs(b - ref[i * 3 + 2]);
+    if (diff <= thr) continue;
+    fg[i] = 1;
+    rgb2hsv(r, g, b);
+    if (hS >= S.sMin && hV >= S.vMin) {
+      let dh = Math.abs(hH - S.tapeH); if (dh > 0.5) dh = 1 - dh;
+      if (dh <= S.hueTol) { tp[i] = 1; tcount++; }
+    }
+  }
+
+  let final, tape;
+  tapeSeen = tcount >= 4;
+  if (tapeSeen) {
+    lastSeen = performance.now();
+    const dil = dilate(fg, 1);                       // bridge small gaps so the object stays one blob
+    const comp = new Uint8Array(N), stack = new Int32Array(N);
+    let sp = 0;
+    for (let i = 0; i < N; i++) if (tp[i] && !comp[i]) { comp[i] = 1; stack[sp++] = i; }
+    while (sp) {
+      const i = stack[--sp], x = i % PW;
+      if (x > 0 && dil[i - 1] && !comp[i - 1]) { comp[i - 1] = 1; stack[sp++] = i - 1; }
+      if (x < PW - 1 && dil[i + 1] && !comp[i + 1]) { comp[i + 1] = 1; stack[sp++] = i + 1; }
+      if (i >= PW && dil[i - PW] && !comp[i - PW]) { comp[i - PW] = 1; stack[sp++] = i - PW; }
+      if (i < N - PW && dil[i + PW] && !comp[i + PW]) { comp[i + PW] = 1; stack[sp++] = i + PW; }
+    }
+    final = new Uint8Array(N);
+    for (let i = 0; i < N; i++) final[i] = comp[i] && fg[i] ? 1 : 0;
+    final = dilate(final, S.grow);
+    tape = dilate(tp, 1);
+    lastFinal = final; lastTape = tape;
+  } else if (lastFinal && performance.now() - lastSeen < S.hold * 1000) {
+    final = lastFinal; tape = lastTape;               // paper briefly hidden (e.g. by a hand): keep last mask
+  } else {
+    final = new Uint8Array(N); tape = final;
+  }
+
+  for (let i = 0; i < N; i++) {
+    const s = (smooth[i] = smooth[i] * 0.4 + final[i] * 0.6);
+    rgba[i * 4] = s * 255; rgba[i * 4 + 1] = tape[i] * 255; rgba[i * 4 + 2] = 0; rgba[i * 4 + 3] = 255;
+  }
+  gl.activeTexture(gl.TEXTURE1);
+  gl.bindTexture(gl.TEXTURE_2D, maskTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, PW, PH, 0, gl.RGBA, gl.UNSIGNED_BYTE, rgba);
+  gl.activeTexture(gl.TEXTURE0);
+}
+refreshMaskInfo();
+
+/* ---------- WebRTC receive ---------- */
+let ws, pc, wakeLock, retry = 0, pending = [], connState = "idle";
+let ice = [{ urls: "stun:stun.cloudflare.com:3478" }];
+const send = (o) => ws && ws.readyState === 1 && ws.send(JSON.stringify(o));
+const setMsg = (t) => ($("msg").textContent = t);
+
+function newPC() {
+  if (pc) pc.close();
+  pending = [];
+  pc = new RTCPeerConnection({ iceServers: ice });
+  pc.onicecandidate = (e) => e.candidate && send({ type: "ice", candidate: e.candidate });
+  pc.onconnectionstatechange = () => { connState = pc.connectionState; if (connState === "connected") setMsg(""); };
+  pc.ontrack = (e) => {
+    try { e.receiver.jitterBufferTarget = 0; } catch {}           // lowest latency where supported
+    try { e.receiver.playoutDelayHint = 0; } catch {}
+    vid.srcObject = e.streams[0] || new MediaStream([e.track]);
+    vid.play().catch(() => {});
+  };
+}
+
+function connectWS() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${proto}//${location.host}/ws?room=${encodeURIComponent(room)}&role=viewer`);
+  ws.onopen = () => { retry = 0; connState = "waiting for sender"; setMsg("Waiting for the sender…"); };
+  ws.onmessage = async (ev) => {
+    let m; try { m = JSON.parse(ev.data); } catch { return; }
+    if (m.type === "offer") {
+      newPC();
+      await pc.setRemoteDescription(m.sdp);
+      for (const c of pending) pc.addIceCandidate(c).catch(() => {});
+      pending = [];
+      const ans = await pc.createAnswer();
+      await pc.setLocalDescription(ans);
+      send({ type: "answer", sdp: pc.localDescription });
+    } else if (m.type === "ice") {
+      if (pc && pc.remoteDescription) pc.addIceCandidate(m.candidate).catch(() => {});
+      else pending.push(m.candidate);
+    } else if (m.type === "peer-left") {
+      connState = "sender left"; setMsg("Sender disconnected. Waiting…");
+      if (pc) { pc.close(); pc = null; }
+      vid.srcObject = null;
+    } else if (m.type === "replaced") {
+      ws.onclose = null; setMsg("Another viewer took over this room.");
+    }
+  };
+  ws.onclose = () => { connState = "reconnecting"; setTimeout(connectWS, Math.min(1000 * 2 ** retry++, 8000)); };
+}
+setInterval(() => ws && ws.readyState === 1 && ws.send("ping"), 20000);
+
+async function keepAwake() { try { wakeLock = await navigator.wakeLock.request("screen"); } catch {} }
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") keepAwake(); });
+
+$("go").onclick = async () => {
+  $("start").style.display = "none";
+  vid.play().catch(() => {});
+  keepAwake();
+  try { const r = await fetch("/ice"); ice = (await r.json()).iceServers || ice; } catch {}
+  connectWS();
+};
+
+setMsg("Tap to start");
+requestAnimationFrame(draw);
+// Debug hook (used by the test script).
+window.__portal = { get S() { return S; }, vid, captureEmpty, samplePaper, get tapeSeen() { return tapeSeen; }, get state() { return connState; } };
+</script>
+</body>
+</html>
